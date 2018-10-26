@@ -1,0 +1,5 @@
+need to switch to the django vevn with :
+c:\users\djones\.virtualenvs\djangodev\Scripts\activate
+
+follow tutorial at 
+ https://docs.djangoproject.com/en/2.1/intro/tutorial01/
