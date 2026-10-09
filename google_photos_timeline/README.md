@@ -39,11 +39,33 @@ Supported types: JPEG, HEIC/HEIF, TIFF, DNG. Videos and other formats are listed
    python geotag_from_timeline.py --timeline Timeline.json --takeout C:\Takeout --out C:\Geotagged --dry-run
    ```
 
-   Open `C:\Geotagged\geotag_report.csv` and spot-check some `would_tag` rows. Paste the `lat,lng`
+   Read the timezone check it prints (see below). Then open `C:\Geotagged\geotag_report.csv` and
+   spot-check some `would_tag` rows. Paste the `lat,lng`
    into Google Maps to confirm the location. Adjust `--max-gap` if needed.
 5. **Run for real.** Use the same command without `--dry-run`.
 6. **Upload** the contents of `C:\Geotagged` (not the CSV) at <https://photos.google.com> (Upload button
    or drag and drop).
+
+## Timezone check
+
+Timeline timestamps include a UTC offset, and the script matches photos using absolute (UTC) times.
+In one real export, timestamps for UK locations carried `+03:00` while the same segments said
+`startTimeTimezoneUtcOffsetMinutes: 0`. If those offsets are wrong, every match is shifted by hours.
+
+To catch this, each run uses photos that **already have camera GPS** and compares each one with the
+Timeline location at the same moment. It tries shifts from -14 to +14 hours in 30-minute steps and
+prints the best ones:
+
+```
+Time-shift check using 812 photos that already have camera GPS:
+  shift(h)  matched  within 1 km  median km
+     +0.0      790          741       0.05  <- current
+```
+
+If a different shift matches clearly better, the script prints a warning and **copies nothing**.
+If the table shows a consistent winner, rerun with `--time-shift <hours>`, or add
+`--ignore-shift-check` to write anyway. This check only works when your Takeout contains photos taken
+with location turned on.
 
 ## Things to know before uploading
 

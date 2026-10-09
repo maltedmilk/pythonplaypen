@@ -111,6 +111,54 @@ class LocateTests(unittest.TestCase):
         self.assertEqual(self.tl.utc_offset_minutes(g.parse_time("2024-06-01T10:30:00+01:00")), 60)
 
 
+def moving_timeline(label_offset_hours=0):
+    """A day of hourly path points moving 0.1 degrees east per hour from (51.5, -3.0).
+
+    label_offset_hours > 0 simulates UK-local times wrongly labelled as +HH:00."""
+    start = datetime(2024, 6, 1, 0, 0, tzinfo=timezone.utc)
+    tz = timezone(timedelta(hours=label_offset_hours))
+    path = []
+    for h in range(24):
+        true_t = start + timedelta(hours=h)
+        labelled = true_t.replace(tzinfo=None).replace(tzinfo=tz)  # same clock time, wrong offset
+        path.append({"point": "51.5°, %.1f°" % (-3.0 + 0.1 * h), "time": labelled.isoformat()})
+    return {"semanticSegments": [{"startTime": path[0]["time"], "endTime": path[-1]["time"],
+                                  "timelinePath": path}]}
+
+
+def known_photos():
+    """(taken_utc, lat, lng) for photos taken on the hour along moving_timeline's true route."""
+    start = datetime(2024, 6, 1, 0, 0, tzinfo=timezone.utc)
+    return [(start + timedelta(hours=h), 51.5, -3.0 + 0.1 * h) for h in range(4, 20)]
+
+
+class CalibrationTests(unittest.TestCase):
+    def load(self, data):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        self.addCleanup(os.unlink, path)
+        return g.load_timeline(path)
+
+    def test_correct_timeline_prefers_zero(self):
+        results, n = g.calibrate(self.load(moving_timeline(0)), known_photos(), timedelta(minutes=30))
+        self.assertEqual(results[0][0], 0)
+        self.assertEqual(results[0][2], n)
+
+    def test_mislabelled_timeline_detects_shift(self):
+        tl = self.load(moving_timeline(3))
+        results, _ = g.calibrate(tl, known_photos(), timedelta(minutes=30))
+        self.assertEqual(results[0][0], 3)
+        self.assertEqual(tl.shift, timedelta(0))  # calibrate restores the shift
+
+    def test_time_shift_applied_to_lookup(self):
+        tl = self.load(moving_timeline(3))
+        taken, lat, lng = known_photos()[0]
+        tl.shift = timedelta(hours=3)
+        hit = tl.locate(taken, timedelta(minutes=30))
+        self.assertAlmostEqual(hit[1], lng)
+
+
 @unittest.skipUnless(shutil.which("exiftool"), "exiftool not installed")
 class EndToEndTests(unittest.TestCase):
     def setUp(self):
@@ -168,6 +216,36 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(f.read(), TINY_JPEG)
         # Only tagged files are copied.
         self.assertFalse(os.path.exists(os.path.join(self.out, "Google Photos", "Photos from 2024", "has_geo.jpg")))
+
+    def test_shift_check_blocks_writing(self):
+        # Mislabelled Timeline plus camera-geotagged photos along the true route.
+        with open(self.timeline, "w") as f:
+            json.dump(moving_timeline(3), f)
+        for k, (taken, lat, lng) in enumerate(known_photos()):
+            name = "gps_%02d.jpg" % k
+            path = os.path.join(self.takeout, name)
+            with open(path, "wb") as f:
+                f.write(TINY_JPEG)
+            subprocess.run(["exiftool", "-q", "-overwrite_original", "-GPSLatitude=%f" % lat,
+                            "-GPSLatitudeRef=N", "-GPSLongitude=%f" % abs(lng), "-GPSLongitudeRef=W", path],
+                           check=True)
+            with open(path + ".json", "w") as f:
+                json.dump(sidecar(name, taken.isoformat()), f)
+        # A photo without GPS that would otherwise be tagged.
+        with open(os.path.join(self.takeout, "untagged.jpg"), "wb") as f:
+            f.write(TINY_JPEG)
+        with open(os.path.join(self.takeout, "untagged.jpg.json"), "w") as f:
+            json.dump(sidecar("untagged.jpg", "2024-06-01T10:00:00+00:00"), f)
+
+        takeout = os.path.join(self.tmp, "Takeout")
+        g.run(["--timeline", self.timeline, "--takeout", takeout, "--out", self.out])
+        self.assertEqual(self.report()["untagged.jpg"]["status"], "would_tag")
+        self.assertEqual(os.listdir(self.out), ["geotag_report.csv"])
+
+        g.run(["--timeline", self.timeline, "--takeout", takeout, "--out", self.out, "--time-shift", "3"])
+        r = self.report()["untagged.jpg"]
+        self.assertEqual(r["status"], "tagged")
+        self.assertAlmostEqual(float(r["lng"]), -2.0, places=4)
 
     def test_dry_run_copies_nothing(self):
         g.run(["--timeline", self.timeline, "--takeout", os.path.join(self.tmp, "Takeout"),

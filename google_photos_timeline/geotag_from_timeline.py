@@ -20,6 +20,7 @@ import argparse
 import bisect
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -79,32 +80,45 @@ def parse_time(value):
     return dt.astimezone(timezone.utc)
 
 
+class _Intervals:
+    """Sorted (start, end, ...) tuples with a fast 'which intervals contain t' lookup."""
+
+    def __init__(self, items):
+        self.items = sorted(items, key=lambda x: x[0])
+        self.starts = [x[0] for x in self.items]
+        self.max_len = max((x[1] - x[0] for x in self.items), default=timedelta(0))
+
+    def containing(self, t):
+        i = bisect.bisect_right(self.starts, t) - 1
+        while i >= 0 and self.starts[i] >= t - self.max_len:
+            if self.items[i][1] >= t:
+                yield self.items[i]
+            i -= 1
+
+
 class Timeline:
     def __init__(self):
         self.visits = []    # (start, end, lat, lng, place_id, utc_offset_minutes)
         self.points = []    # (time, lat, lng, source)
         self.offsets = []   # (start, end, utc_offset_minutes) from segments
+        self.shift = timedelta(0)  # added to every Timeline timestamp (see --time-shift)
 
     def finalize(self):
         self.points.sort(key=lambda p: p[0])
         self._times = [p[0] for p in self.points]
-        self.visits.sort(key=lambda v: v[0])
-        self._visit_starts = [v[0] for v in self.visits]
+        self._visits = _Intervals(self.visits)
+        self._offsets = _Intervals(self.offsets)
 
     def utc_offset_minutes(self, t):
-        for start, end, offset in self.offsets:
-            if start <= t <= end:
-                return offset
+        for item in self._offsets.containing(t - self.shift):
+            return item[2]
         return None
 
     def locate(self, t, max_gap):
         """Return (lat, lng, method, gap_minutes, place_id) for UTC time t, or None."""
+        t = t - self.shift
         # 1. Inside a visit: use the shortest (most specific) visit containing t.
-        best = None
-        i = bisect.bisect_right(self._visit_starts, t)
-        for v in self.visits[:i]:
-            if v[0] <= t <= v[1] and (best is None or v[1] - v[0] < best[1] - best[0]):
-                best = v
+        best = min(self._visits.containing(t), key=lambda v: v[1] - v[0], default=None)
         if best:
             return best[2], best[3], "visit", 0.0, best[4]
 
@@ -331,6 +345,60 @@ def write_tags(exiftool, jobs, batch=200):
     return failed
 
 
+# --------------------------------------------------------------------------- calibration
+
+def distance_km(lat1, lng1, lat2, lng2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lng2 - lng1)
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(min(1.0, h)))
+
+
+def calibrate(tl, known, max_gap, shifts_hours=None, max_samples=1000):
+    """Score candidate time shifts using photos whose camera already recorded GPS.
+
+    known: list of (taken_utc, lat, lng). Returns [(shift_hours, matched, within_1km, median_km)],
+    best first. A correct shift puts most photos within 1 km of the Timeline location."""
+    if shifts_hours is None:
+        shifts_hours = [h / 2 for h in range(-28, 29)]   # -14h .. +14h in 30-minute steps
+    step = max(1, len(known) // max_samples)
+    sample = known[::step]
+    original = tl.shift
+    results = []
+    try:
+        for h in shifts_hours:
+            tl.shift = timedelta(hours=h)
+            dists = []
+            for taken, lat, lng in sample:
+                hit = tl.locate(taken, max_gap)
+                if hit:
+                    dists.append(distance_km(lat, lng, hit[0], hit[1]))
+            dists.sort()
+            near = sum(1 for d in dists if d <= 1.0)
+            median = dists[len(dists) // 2] if dists else float("nan")
+            results.append((h, len(dists), near, median))
+    finally:
+        tl.shift = original
+    results.sort(key=lambda r: (-r[2], r[3] if r[1] else float("inf")))
+    return results, len(sample)
+
+
+def print_calibration(results, n, current_shift):
+    print("\nTime-shift check using %d photos that already have camera GPS:" % n)
+    print("  shift(h)  matched  within 1 km  median km")
+    current = None
+    for r in results:
+        if r[0] == current_shift:
+            current = r
+    for r in results[:5] + ([current] if current and current not in results[:5] else []):
+        mark = "  <- current" if r[0] == current_shift else ""
+        print("  %+7.1f  %7d  %11d  %9.2f%s" % (r[0], r[1], r[2], r[3], mark))
+    best = results[0]
+    if current and best[0] != current_shift and best[2] > current[2] * 1.2 + 5:
+        return best[0]
+    return None
+
+
 # --------------------------------------------------------------------------- main
 
 def collect_media(root):
@@ -356,6 +424,10 @@ def run(argv=None):
     ap.add_argument("--max-gap", type=float, default=30,
                     help="max minutes between photo and a timeline point outside visits (default 30)")
     ap.add_argument("--dry-run", action="store_true", help="write the report only; copy nothing")
+    ap.add_argument("--time-shift", type=float, default=0,
+                    help="hours to add to every Timeline timestamp, if the check shows they're offset (default 0)")
+    ap.add_argument("--ignore-shift-check", action="store_true",
+                    help="write files even if the time-shift check suggests a different --time-shift")
     ap.add_argument("--exiftool", default=shutil.which("exiftool") or "exiftool", help="path to exiftool")
     a = ap.parse_args(argv)
 
@@ -367,6 +439,7 @@ def run(argv=None):
         ap.error("exiftool not found; install it from https://exiftool.org or pass --exiftool")
 
     tl = load_timeline(a.timeline)
+    tl.shift = timedelta(hours=a.time_shift)
     print("Timeline: %d visits, %d location points" % (len(tl.visits), len(tl.points)))
     if tl.points or tl.visits:
         all_t = [p[0] for p in tl.points] + [v[0] for v in tl.visits]
@@ -380,7 +453,7 @@ def run(argv=None):
     exif = read_exif(a.exiftool, [p for p, _ in images]) if have_exiftool else {}
 
     max_gap = timedelta(minutes=a.max_gap)
-    rows, jobs = [], []
+    rows, jobs, known = [], [], []
     for path, sidecar in media:
         rel = os.path.relpath(path, takeout)
         row = {"file": rel, "status": "", "taken_utc": "", "time_source": "", "lat": "", "lng": "",
@@ -391,12 +464,15 @@ def run(argv=None):
             continue
         ex = exif.get(os.path.normcase(os.path.abspath(path)), {})
         side_time, side_geo = read_sidecar(sidecar) if sidecar else (None, False)
-        if ex.get("GPSLatitude") or ex.get("GPSLongitude") or side_geo:
-            row["status"] = "skipped_has_location"
-            continue
         taken, row["time_source"] = side_time, "sidecar"
         if taken is None:
             taken, row["time_source"] = exif_time(ex), "exif"
+        if ex.get("GPSLatitude") or ex.get("GPSLongitude") or side_geo:
+            row["status"] = "skipped_has_location"
+            if taken and isinstance(ex.get("GPSLatitude"), (int, float)) \
+                    and isinstance(ex.get("GPSLongitude"), (int, float)):
+                known.append((taken, ex["GPSLatitude"], ex["GPSLongitude"]))
+            continue
         if taken is None:
             row["status"], row["time_source"] = "skipped_no_reliable_time", ""
             continue
@@ -413,6 +489,21 @@ def run(argv=None):
         jobs.append({"src": path, "dest": dest, "lat": lat, "lng": lng, "row": row,
                      "set_date": None if ex.get("DateTimeOriginal") else taken,
                      "utc_offset": tl.utc_offset_minutes(taken)})
+
+    suggested = None
+    if known:
+        results, n = calibrate(tl, known, max_gap)
+        suggested = print_calibration(results, n, a.time_shift)
+    else:
+        print("\nTime-shift check skipped: no photos with camera GPS to compare against.")
+    if suggested is not None:
+        print("WARNING: --time-shift %g matches your geotagged photos better than the current %g."
+              % (suggested, a.time_shift))
+        if not a.dry_run and not a.ignore_shift_check:
+            print("Nothing copied. Rerun with --time-shift %g, or add --ignore-shift-check." % suggested)
+            a.dry_run = True
+            for job in jobs:
+                job["row"]["status"] = "would_tag"
 
     if not a.dry_run and jobs:
         for job in jobs:
