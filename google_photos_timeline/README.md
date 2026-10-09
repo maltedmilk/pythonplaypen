@@ -54,7 +54,7 @@ In one real export, timestamps for UK locations carried `+03:00` while the same 
 
 To catch this, each run uses photos that **already have camera GPS** and compares each one with the
 Timeline location at the same moment. It tries shifts from -14 to +14 hours in 30-minute steps and
-prints the best ones:
+prints the best ones. Example output (illustrative numbers):
 
 ```
 Time-shift check using 812 photos that already have camera GPS:
