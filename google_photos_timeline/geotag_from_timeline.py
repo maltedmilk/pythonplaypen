@@ -269,6 +269,34 @@ def read_sidecar(path):
     return taken, has_geo
 
 
+# --------------------------------------------------------------------------- progress
+
+class Progress:
+    """Single-line 'label: done/total (pct%)' counter; prints a new line every 10% when not a terminal."""
+
+    def __init__(self, label, total):
+        self.label, self.total, self.done = label, total, 0
+        self.tty = sys.stdout.isatty()
+        self._last_pct = -1
+        self._show()
+
+    def advance(self, n=1):
+        self.done = min(self.total, self.done + n)
+        self._show()
+
+    def _show(self):
+        pct = 100 * self.done // self.total if self.total else 100
+        if self.tty:
+            print("\r%s: %d/%d (%d%%)" % (self.label, self.done, self.total, pct), end="", flush=True)
+        elif pct // 10 != self._last_pct // 10 or self.done == self.total:
+            print("%s: %d/%d (%d%%)" % (self.label, self.done, self.total, pct), flush=True)
+        self._last_pct = pct
+
+    def finish(self):
+        if self.tty:
+            print()
+
+
 # --------------------------------------------------------------------------- exiftool
 
 def _exiftool_cmd(exiftool, args):
@@ -283,11 +311,12 @@ def _exiftool_cmd(exiftool, args):
         os.unlink(argfile)
 
 
-def read_exif(exiftool, files):
+def read_exif(exiftool, files, batch=100):
     """Return {abs_path: {tag: value}} for GPS and capture-time tags."""
     out = {}
-    for i in range(0, len(files), 500):
-        chunk = files[i:i + 500]
+    progress = Progress("Reading photo metadata", len(files))
+    for i in range(0, len(files), batch):
+        chunk = files[i:i + batch]
         args = ["-json", "-n", "-GPSLatitude", "-GPSLongitude", "-DateTimeOriginal",
                 "-OffsetTimeOriginal", "-charset", "exif=utf8"] + chunk
         res = _exiftool_cmd(exiftool, args)
@@ -297,6 +326,8 @@ def read_exif(exiftool, files):
             rows = []
         for row in rows:
             out[os.path.normcase(os.path.abspath(row.get("SourceFile", "")))] = row
+        progress.advance(len(chunk))
+    progress.finish()
     return out
 
 
@@ -315,11 +346,12 @@ def exif_time(row):
         return None
 
 
-def write_tags(exiftool, jobs, batch=200):
+def write_tags(exiftool, jobs, batch=50):
     """jobs: list of dicts with dest, lat, lng, and optional set_date (UTC) and utc_offset (minutes).
 
     Returns the set of dest paths ExifTool reported errors for."""
     failed = set()
+    progress = Progress("Writing locations", len(jobs))
     for b in range(0, len(jobs), batch):
         args = []
         for job in jobs[b:b + batch]:
@@ -338,10 +370,12 @@ def write_tags(exiftool, jobs, batch=200):
         res = _exiftool_cmd(exiftool, args)
         err = res.stderr.decode("utf-8", "replace")
         if err:
-            sys.stderr.write(err)
+            sys.stderr.write("\n" + err)
         for job in jobs[b:b + batch]:
             if job["dest"] in err:
                 failed.add(job["dest"])
+        progress.advance(len(jobs[b:b + batch]))
+    progress.finish()
     return failed
 
 
@@ -365,6 +399,7 @@ def calibrate(tl, known, max_gap, shifts_hours=None, max_samples=1000):
     sample = known[::step]
     original = tl.shift
     results = []
+    progress = Progress("Checking time shifts", len(shifts_hours))
     try:
         for h in shifts_hours:
             tl.shift = timedelta(hours=h)
@@ -377,7 +412,9 @@ def calibrate(tl, known, max_gap, shifts_hours=None, max_samples=1000):
             near = sum(1 for d in dists if d <= 1.0)
             median = dists[len(dists) // 2] if dists else float("nan")
             results.append((h, len(dists), near, median))
+            progress.advance()
     finally:
+        progress.finish()
         tl.shift = original
     results.sort(key=lambda r: (-r[2], r[3] if r[1] else float("inf")))
     return results, len(sample)
@@ -438,6 +475,7 @@ def run(argv=None):
     if not a.dry_run and shutil.which(a.exiftool) is None and not os.path.isfile(a.exiftool):
         ap.error("exiftool not found; install it from https://exiftool.org or pass --exiftool")
 
+    print("Loading Timeline...", flush=True)
     tl = load_timeline(a.timeline)
     tl.shift = timedelta(hours=a.time_shift)
     print("Timeline: %d visits, %d location points" % (len(tl.visits), len(tl.points)))
@@ -445,7 +483,10 @@ def run(argv=None):
         all_t = [p[0] for p in tl.points] + [v[0] for v in tl.visits]
         print("Timeline covers %s to %s (UTC)" % (min(all_t).date(), max(all_t).date()))
 
+    print("Scanning Takeout folder...", flush=True)
     media = collect_media(takeout)
+    print("Found %d files (%d photos of a supported type)" % (
+        len(media), sum(1 for p, _ in media if os.path.splitext(p)[1].lower() in IMAGE_EXTS)))
     images = [(p, s) for p, s in media if os.path.splitext(p)[1].lower() in IMAGE_EXTS]
     have_exiftool = shutil.which(a.exiftool) is not None or os.path.isfile(a.exiftool)
     if not have_exiftool:
@@ -506,9 +547,12 @@ def run(argv=None):
                 job["row"]["status"] = "would_tag"
 
     if not a.dry_run and jobs:
+        progress = Progress("Copying photos", len(jobs))
         for job in jobs:
             os.makedirs(os.path.dirname(job["dest"]), exist_ok=True)
             shutil.copy2(job["src"], job["dest"])
+            progress.advance()
+        progress.finish()
         failed = write_tags(a.exiftool, jobs)
         for job in jobs:
             if job["dest"] in failed:
