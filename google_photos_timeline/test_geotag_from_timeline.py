@@ -129,7 +129,7 @@ def moving_timeline(label_offset_hours=0):
 def known_photos():
     """(taken_utc, lat, lng) for photos taken on the hour along moving_timeline's true route."""
     start = datetime(2024, 6, 1, 0, 0, tzinfo=timezone.utc)
-    return [(start + timedelta(hours=h), 51.5, -3.0 + 0.1 * h) for h in range(4, 20)]
+    return [(start + timedelta(hours=h / 2), 51.5, -3.0 + 0.05 * h) for h in range(8, 39)]
 
 
 class CalibrationTests(unittest.TestCase):
@@ -141,15 +141,25 @@ class CalibrationTests(unittest.TestCase):
         return g.load_timeline(path)
 
     def test_correct_timeline_prefers_zero(self):
-        results, n = g.calibrate(self.load(moving_timeline(0)), known_photos(), timedelta(minutes=30))
+        results, n, _ = g.calibrate(self.load(moving_timeline(0)), known_photos(), timedelta(minutes=30))
         self.assertEqual(results[0][0], 0)
         self.assertEqual(results[0][2], n)
 
     def test_mislabelled_timeline_detects_shift(self):
         tl = self.load(moving_timeline(3))
-        results, _ = g.calibrate(tl, known_photos(), timedelta(minutes=30))
+        results, _, _ = g.calibrate(tl, known_photos(), timedelta(minutes=30))
         self.assertEqual(results[0][0], 3)
         self.assertEqual(tl.shift, timedelta(0))  # calibrate restores the shift
+
+    def test_photos_after_timeline_end_are_ignored(self):
+        # Regression: photos taken after the export near the last Timeline location made a
+        # +12h shift look best, because shifting pulled them into the Timeline's final hours.
+        tl = self.load(moving_timeline(0))
+        end = datetime(2024, 6, 1, 23, 0, tzinfo=timezone.utc)
+        after = [(end + timedelta(hours=10, minutes=m), 51.5, -0.7) for m in range(0, 120, 2)]
+        results, n, left_out = g.calibrate(tl, after + known_photos()[:3], timedelta(minutes=30))
+        self.assertEqual((n, left_out), (3, 60))
+        self.assertIsNone(g.print_calibration(results, n, left_out, 0))
 
     def test_time_shift_applied_to_lookup(self):
         tl = self.load(moving_timeline(3))
@@ -240,7 +250,11 @@ class EndToEndTests(unittest.TestCase):
         takeout = os.path.join(self.tmp, "Takeout")
         g.run(["--timeline", self.timeline, "--takeout", takeout, "--out", self.out])
         self.assertEqual(self.report()["untagged.jpg"]["status"], "would_tag")
-        self.assertEqual(os.listdir(self.out), ["geotag_report.csv"])
+        self.assertEqual(sorted(os.listdir(self.out)), ["geotag_report.csv", "time_shift_check.csv"])
+        with open(os.path.join(self.out, "time_shift_check.csv"), newline="") as f:
+            detail = list(csv.DictReader(f))
+        self.assertEqual(len(detail), len(known_photos()))
+        self.assertTrue(all(float(d["distance_km"]) > 1 for d in detail if d["distance_km"]))
 
         g.run(["--timeline", self.timeline, "--takeout", takeout, "--out", self.out, "--time-shift", "3"])
         r = self.report()["untagged.jpg"]

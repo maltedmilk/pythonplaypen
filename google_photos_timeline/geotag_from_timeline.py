@@ -108,6 +108,9 @@ class Timeline:
         self._times = [p[0] for p in self.points]
         self._visits = _Intervals(self.visits)
         self._offsets = _Intervals(self.offsets)
+        times = self._times + [v[0] for v in self.visits] + [v[1] for v in self.visits]
+        self.start = min(times) if times else None
+        self.end = max(times) if times else None
 
     def utc_offset_minutes(self, t):
         for item in self._offsets.containing(t - self.shift):
@@ -388,15 +391,20 @@ def distance_km(lat1, lng1, lat2, lng2):
     return 6371 * 2 * math.asin(math.sqrt(min(1.0, h)))
 
 
+MIN_CALIBRATION_PHOTOS = 20
+
+
 def calibrate(tl, known, max_gap, shifts_hours=None, max_samples=1000):
     """Score candidate time shifts using photos whose camera already recorded GPS.
 
-    known: list of (taken_utc, lat, lng). Returns [(shift_hours, matched, within_1km, median_km)],
-    best first. A correct shift puts most photos within 1 km of the Timeline location."""
+    known: list of (taken_utc, lat, lng[, file]). Only photos taken within the Timeline's date range
+    are used: shifting photos from outside it into it would reward large, meaningless shifts.
+    Returns ([(shift_hours, matched, within_1km, median_km)] best first, photos used, photos left out)."""
     if shifts_hours is None:
         shifts_hours = [h / 2 for h in range(-28, 29)]   # -14h .. +14h in 30-minute steps
-    step = max(1, len(known) // max_samples)
-    sample = known[::step]
+    inside = [k for k in known if tl.start and tl.start <= k[0] <= tl.end]
+    step = max(1, len(inside) // max_samples)
+    sample = inside[::step]
     original = tl.shift
     results = []
     progress = Progress("Checking time shifts", len(shifts_hours))
@@ -404,10 +412,10 @@ def calibrate(tl, known, max_gap, shifts_hours=None, max_samples=1000):
         for h in shifts_hours:
             tl.shift = timedelta(hours=h)
             dists = []
-            for taken, lat, lng in sample:
-                hit = tl.locate(taken, max_gap)
+            for k in sample:
+                hit = tl.locate(k[0], max_gap)
                 if hit:
-                    dists.append(distance_km(lat, lng, hit[0], hit[1]))
+                    dists.append(distance_km(k[1], k[2], hit[0], hit[1]))
             dists.sort()
             near = sum(1 for d in dists if d <= 1.0)
             median = dists[len(dists) // 2] if dists else float("nan")
@@ -416,24 +424,46 @@ def calibrate(tl, known, max_gap, shifts_hours=None, max_samples=1000):
     finally:
         progress.finish()
         tl.shift = original
-    results.sort(key=lambda r: (-r[2], r[3] if r[1] else float("inf")))
-    return results, len(sample)
+    results.sort(key=lambda r: (-r[2], r[3] if r[1] else float("inf"), abs(r[0])))
+    return results, len(sample), len(known) - len(inside)
 
 
-def print_calibration(results, n, current_shift):
-    print("\nTime-shift check using %d photos that already have camera GPS:" % n)
+def print_calibration(results, n, left_out, current_shift):
+    """Print the table; return a better shift to suggest, or None."""
+    print("\nTime-shift check using %d photos that have camera GPS and fall within the Timeline's dates"
+          % n + (" (%d others are outside those dates and were not used)" % left_out if left_out else "") + ":")
     print("  shift(h)  matched  within 1 km  median km")
-    current = None
-    for r in results:
-        if r[0] == current_shift:
-            current = r
+    current = next((r for r in results if r[0] == current_shift), None)
     for r in results[:5] + ([current] if current and current not in results[:5] else []):
         mark = "  <- current" if r[0] == current_shift else ""
         print("  %+7.1f  %7d  %11d  %9.2f%s" % (r[0], r[1], r[2], r[3], mark))
+    if n < MIN_CALIBRATION_PHOTOS:
+        print("Inconclusive: fewer than %d photos to compare. Check some report rows by hand instead."
+              % MIN_CALIBRATION_PHOTOS)
+        return None
     best = results[0]
-    if current and best[0] != current_shift and best[2] > current[2] * 1.2 + 5:
+    if current and best[0] != current_shift and best[2] > current[2] * 1.2 + 5 and best[2] >= best[1] / 2:
         return best[0]
     return None
+
+
+def write_calibration_detail(path, tl, known, max_gap):
+    """Per-photo comparison at the current shift, for checking the check."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["file", "taken_utc", "in_timeline_dates", "photo_lat", "photo_lng",
+                    "timeline_lat", "timeline_lng", "method", "gap_minutes", "distance_km"])
+        for k in sorted(known, key=lambda k: k[0]):
+            taken, lat, lng = k[:3]
+            inside = bool(tl.start and tl.start <= taken <= tl.end)
+            hit = tl.locate(taken, max_gap)
+            row = [k[3] if len(k) > 3 else "", taken.isoformat(), inside, "%.6f" % lat, "%.6f" % lng]
+            if hit:
+                row += ["%.6f" % hit[0], "%.6f" % hit[1], hit[2], hit[3],
+                        "%.2f" % distance_km(lat, lng, hit[0], hit[1])]
+            else:
+                row += ["", "", "no_match", "", ""]
+            w.writerow(row)
 
 
 # --------------------------------------------------------------------------- main
@@ -512,7 +542,7 @@ def run(argv=None):
             row["status"] = "skipped_has_location"
             if taken and isinstance(ex.get("GPSLatitude"), (int, float)) \
                     and isinstance(ex.get("GPSLongitude"), (int, float)):
-                known.append((taken, ex["GPSLatitude"], ex["GPSLongitude"]))
+                known.append((taken, ex["GPSLatitude"], ex["GPSLongitude"], rel))
             continue
         if taken is None:
             row["status"], row["time_source"] = "skipped_no_reliable_time", ""
@@ -531,10 +561,15 @@ def run(argv=None):
                      "set_date": None if ex.get("DateTimeOriginal") else taken,
                      "utc_offset": tl.utc_offset_minutes(taken)})
 
+    report = a.report or os.path.join(out, "geotag_report.csv")
+    os.makedirs(os.path.dirname(os.path.abspath(report)), exist_ok=True)
     suggested = None
     if known:
-        results, n = calibrate(tl, known, max_gap)
-        suggested = print_calibration(results, n, a.time_shift)
+        results, n, left_out = calibrate(tl, known, max_gap)
+        suggested = print_calibration(results, n, left_out, a.time_shift)
+        detail = os.path.join(os.path.dirname(os.path.abspath(report)), "time_shift_check.csv")
+        write_calibration_detail(detail, tl, known, max_gap)
+        print("Per-photo detail: %s" % detail)
     else:
         print("\nTime-shift check skipped: no photos with camera GPS to compare against.")
     if suggested is not None:
@@ -558,8 +593,6 @@ def run(argv=None):
             if job["dest"] in failed:
                 job["row"]["status"] = "write_failed"
 
-    report = a.report or os.path.join(out, "geotag_report.csv")
-    os.makedirs(os.path.dirname(os.path.abspath(report)), exist_ok=True)
     with open(report, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["file"])
         w.writeheader()

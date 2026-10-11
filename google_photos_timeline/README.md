@@ -52,20 +52,26 @@ Timeline timestamps include a UTC offset, and the script matches photos using ab
 In one real export, timestamps for UK locations carried `+03:00` while the same segments said
 `startTimeTimezoneUtcOffsetMinutes: 0`. If those offsets are wrong, every match is shifted by hours.
 
-To catch this, each run uses photos that **already have camera GPS** and compares each one with the
-Timeline location at the same moment. It tries shifts from -14 to +14 hours in 30-minute steps and
-prints the best ones. Example output (illustrative numbers):
+To catch this, each run uses photos that **already have camera GPS** and were taken within the
+Timeline's date range. It compares each one with the Timeline location at the same moment, tries
+shifts from -14 to +14 hours in 30-minute steps, and prints the best ones. Example output
+(illustrative numbers):
 
 ```
-Time-shift check using 812 photos that already have camera GPS:
+Time-shift check using 812 photos that have camera GPS and fall within the Timeline's dates:
   shift(h)  matched  within 1 km  median km
      +0.0      790          741       0.05  <- current
 ```
 
-If a different shift matches clearly better, the script prints a warning and **copies nothing**.
-If the table shows a consistent winner, rerun with `--time-shift <hours>`, or add
-`--ignore-shift-check` to write anyway. This check only works when your Takeout contains photos taken
-with location turned on.
+Photos taken outside the Timeline's dates (e.g. after you exported it) are left out. Shifting them
+into range would otherwise make large, meaningless shifts look best.
+
+- With fewer than 20 photos to compare, the check reports **inconclusive** and doesn't block anything.
+- If a different shift matches clearly better, it prints a warning and **copies nothing**. If the table
+  shows a consistent winner, rerun with `--time-shift <hours>`, or add `--ignore-shift-check` to
+  write anyway.
+- `time_shift_check.csv` (next to the report) lists every GPS photo with its distance from the
+  Timeline location at the current shift. Use it to see where the Timeline and your photos disagree.
 
 ## Things to know before uploading
 
